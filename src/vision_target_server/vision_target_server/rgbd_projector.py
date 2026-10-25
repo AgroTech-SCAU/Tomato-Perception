@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 import numpy as np
+import cv2
 
 
 @dataclass(frozen=True)
@@ -65,13 +66,23 @@ def sample_depth(
 
 def project_pixel(u: int, v: int, depth_m: float, camera_info) -> tuple[float, float, float]:
     """Project one pixel/depth sample into the camera optical frame."""
-    fx = float(camera_info.k[0])
-    fy = float(camera_info.k[4])
-    cx = float(camera_info.k[2])
-    cy = float(camera_info.k[5])
-    if fx <= 0.0 or fy <= 0.0:
-        raise ValueError('Invalid camera intrinsics')
-
-    x = (float(u) - cx) * depth_m / fx
-    y = (float(v) - cy) * depth_m / fy
-    return x, y, float(depth_m)
+    matrix = np.asarray(camera_info.k, dtype=np.float64).reshape(3, 3)
+    distortion = np.asarray(camera_info.d, dtype=np.float64)
+    if (not np.isfinite(matrix).all() or not np.isfinite(distortion).all()
+            or matrix[0, 0] <= 0 or matrix[1, 1] <= 0
+            or not np.isfinite(depth_m) or depth_m <= 0):
+        raise ValueError('Invalid camera intrinsics or depth')
+    pixel = np.array([[[float(u), float(v)]]], dtype=np.float64)
+    if distortion.size and np.any(distortion):
+        if camera_info.distortion_model in ('plumb_bob', 'rational_polynomial'):
+            ray = cv2.undistortPoints(pixel, matrix, distortion).reshape(2)
+        elif camera_info.distortion_model == 'equidistant' and distortion.size == 4:
+            ray = cv2.fisheye.undistortPoints(pixel, matrix, distortion).reshape(2)
+        else:
+            raise ValueError('Unsupported camera distortion model')
+    else:
+        ray = np.array([(u - matrix[0, 2]) / matrix[0, 0],
+                        (v - matrix[1, 2]) / matrix[1, 1]])
+    if not np.isfinite(ray).all():
+        raise ValueError('Invalid projected camera ray')
+    return float(ray[0] * depth_m), float(ray[1] * depth_m), float(depth_m)

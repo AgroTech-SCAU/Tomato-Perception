@@ -6,10 +6,11 @@ YOLO inference is executed only when /vision/get_targets is requested.
 
 from dataclasses import dataclass
 import threading
+import math
+import time
 
 import numpy as np
 import rclpy
-from cv_bridge import CvBridge
 from geometry_msgs.msg import Point
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -21,6 +22,7 @@ from vision_interfaces.msg import TargetPoint
 from vision_interfaces.srv import GetTargets
 
 from .detector import YoloDetector
+from .image_buffers import color_bgr, depth_array
 from .rgbd_projector import depth_to_meters, project_pixel, sample_depth
 
 
@@ -51,8 +53,19 @@ class VisionServer(Node):
     def __init__(self):
         super().__init__('vision_server')
         self._declare_parameters()
+        positive = ('default_max_frame_age_sec', 'depth_uint16_scale_m', 'min_depth_m',
+                    'max_depth_m', 'max_depth_mad_m', 'sync_slop_sec')
+        for name in positive:
+            value = float(self.get_parameter(name).value)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be finite and positive')
+        for name in ('inference_confidence_floor', 'default_confidence', 'min_depth_valid_ratio'):
+            value = float(self.get_parameter(name).value)
+            if not math.isfinite(value) or not 0 < value <= 1:
+                raise ValueError(f'{name} must be in (0, 1]')
+        if self.get_parameter('min_depth_m').value >= self.get_parameter('max_depth_m').value:
+            raise ValueError('min_depth_m must be smaller than max_depth_m')
 
-        self._bridge = CvBridge()
         self._snapshot_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self._latest_snapshot = None
@@ -125,24 +138,23 @@ class VisionServer(Node):
     def _on_synced_rgbd(self, color_msg, depth_msg, camera_info_msg):
         """Cache the newest synchronized RGB-D frame without running YOLO."""
         try:
-            color = np.asarray(self._bridge.imgmsg_to_cv2(
-                color_msg, desired_encoding='bgr8'))
-            depth = np.asarray(self._bridge.imgmsg_to_cv2(
-                depth_msg, desired_encoding='passthrough'))
+            color = color_bgr(color_msg)
+            depth = depth_array(depth_msg)
 
             if color.shape[:2] != depth.shape[:2]:
-                self.get_logger().warning(
-                    f'RGB/depth size mismatch: {color.shape[:2]} vs '
-                    f'{depth.shape[:2]}')
-                return
+                raise ValueError(f'RGB/depth size mismatch: {color.shape[:2]} vs {depth.shape[:2]}')
+
+            frames = [msg.header.frame_id for msg in (color_msg, depth_msg, camera_info_msg)]
+            if not frames[0] or len(set(frames)) != 1:
+                raise ValueError('RGB, aligned depth and CameraInfo must share the optical frame')
+            stamp_ns = color_msg.header.stamp.sec * 10**9 + color_msg.header.stamp.nanosec
+            if stamp_ns <= 0:
+                raise ValueError('RGB acquisition timestamp is missing')
 
             height, width = color.shape[:2]
             if (int(camera_info_msg.width) != width or
                     int(camera_info_msg.height) != height):
-                self.get_logger().warning(
-                    f'RGB/CameraInfo size mismatch: {width}x{height} vs '
-                    f'{camera_info_msg.width}x{camera_info_msg.height}')
-                return
+                raise ValueError('RGB/CameraInfo size mismatch')
 
             with self._snapshot_lock:
                 self._sequence += 1
@@ -152,9 +164,11 @@ class VisionServer(Node):
                     depth=depth.copy(),
                     camera_info=camera_info_msg,
                     header=color_msg.header,
-                    received_ns=self.get_clock().now().nanoseconds,
+                    received_ns=time.monotonic_ns(),
                 )
         except Exception as exc:
+            with self._snapshot_lock:
+                self._latest_snapshot = None
             self.get_logger().error(f'RGB-D conversion failed: {exc}')
 
     def _copy_snapshot(self):
@@ -263,6 +277,13 @@ class VisionServer(Node):
         response.targets = []
         return response
 
+    def _frame_age(self, snap):
+        stamp_ns = snap.header.stamp.sec * 10**9 + snap.header.stamp.nanosec
+        source_age = (self.get_clock().now().nanoseconds - stamp_ns) / 1e9
+        if stamp_ns <= 0 or source_age < -0.05:
+            return math.inf
+        return max(source_age, (time.monotonic_ns() - snap.received_ns) / 1e9)
+
     def _on_get_targets(self, request, response):
         """Return all valid 3D targets from the newest synchronized frame."""
         snap = self._copy_snapshot()
@@ -276,12 +297,13 @@ class VisionServer(Node):
         response.header = snap.header
 
         max_age = float(request.max_frame_age_sec)
+        if not math.isfinite(max_age):
+            return self._set_error(response, GetTargets.Response.BAD_FRAME, 'Frame age must be finite')
         if max_age <= 0.0:
             max_age = float(
                 self.get_parameter('default_max_frame_age_sec').value)
 
-        age_sec = (
-            self.get_clock().now().nanoseconds - snap.received_ns) / 1e9
+        age_sec = self._frame_age(snap)
         if age_sec > max_age:
             return self._set_error(
                 response,
@@ -290,6 +312,8 @@ class VisionServer(Node):
             )
 
         confidence = float(request.min_confidence)
+        if not math.isfinite(confidence) or confidence > 1.0:
+            return self._set_error(response, GetTargets.Response.BAD_FRAME, 'Confidence must be finite and at most 1')
         if confidence <= 0.0:
             confidence = float(self.get_parameter('default_confidence').value)
 
@@ -299,6 +323,10 @@ class VisionServer(Node):
 
         try:
             frame = self._infer_snapshot(snap)
+            age_sec = self._frame_age(snap)
+            if age_sec > max_age:
+                return self._set_error(response, GetTargets.Response.STALE_FRAME,
+                                       f'Frame expired during inference: {age_sec:.3f}s')
             targets = self._filter_targets(
                 frame.targets, confidence, request.class_filter)
 
@@ -310,7 +338,7 @@ class VisionServer(Node):
                 f'{frame.skipped_depth} detection(s) skipped for invalid depth')
             return response
         except Exception as exc:
-            self.get_logger().exception('Inference request failed')
+            self.get_logger().error(f'Inference request failed: {exc}')
             return self._set_error(
                 response,
                 GetTargets.Response.INFERENCE_ERROR,

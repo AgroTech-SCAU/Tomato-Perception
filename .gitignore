@@ -1,1 +1,7 @@
 .vscode
+
+best.pt
+
+build/
+install/
+log/
