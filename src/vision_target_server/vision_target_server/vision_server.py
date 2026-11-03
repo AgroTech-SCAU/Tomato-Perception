@@ -1,7 +1,7 @@
 """ROS 2 RGB-D target service.
 
 The node continuously caches synchronized RGB/depth/camera-info frames.
-YOLO inference is executed only when /vision/get_targets is requested.
+After startup warmup, YOLO inference runs only when /vision/get_targets is requested.
 """
 
 from dataclasses import dataclass
@@ -76,6 +76,11 @@ class VisionServer(Node):
         device = self.get_parameter('device').value
         self.get_logger().info(f'Loading YOLO model: {model_path}')
         self._detector = YoloDetector(model_path, device)
+        self.get_logger().info(f'Warming up YOLO on {device}')
+        self._detector.predict(
+            np.zeros((800, 1280, 3), dtype=np.uint8),
+            confidence_floor=float(self.get_parameter('inference_confidence_floor').value),
+        )
 
         color_topic = self.get_parameter('color_topic').value
         depth_topic = self.get_parameter('depth_topic').value
