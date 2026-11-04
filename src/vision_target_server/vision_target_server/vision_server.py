@@ -5,12 +5,14 @@ After startup warmup, YOLO inference runs only when /vision/get_targets is reque
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 import threading
 import math
 import time
 
 import numpy as np
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Point
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -72,10 +74,15 @@ class VisionServer(Node):
         self._latest_target_frame = None
         self._sequence = 0
 
-        model_path = self.get_parameter('model_path').value
+        configured_model = self.get_parameter('model_path').value
+        model_path = (Path(configured_model).expanduser() if configured_model else
+                      Path(get_package_share_directory('vision_target_server')) / 'models' / 'best.pt')
+        if not model_path.is_file():
+            raise FileNotFoundError(f'Project YOLO weights do not exist: {model_path}; '
+                                    'provide best.pt before building or set model_path to a local weights file')
         device = self.get_parameter('device').value
         self.get_logger().info(f'Loading YOLO model: {model_path}')
-        self._detector = YoloDetector(model_path, device)
+        self._detector = YoloDetector(str(model_path), device)
         self.get_logger().info(f'Warming up YOLO on {device}')
         self._detector.predict(
             np.zeros((800, 1280, 3), dtype=np.uint8),
@@ -122,7 +129,7 @@ class VisionServer(Node):
             'depth_topic': '/camera/depth/image_raw',
             'camera_info_topic': '/camera/color/camera_info',
             'service_name': '/vision/get_targets',
-            'model_path': 'yolov8n.pt',
+            'model_path': '',
             'device': 'cpu',
             'inference_confidence_floor': 0.10,
             'default_confidence': 0.40,

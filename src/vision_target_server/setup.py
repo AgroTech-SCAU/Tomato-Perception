@@ -16,6 +16,8 @@ setup(
             glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'),
             glob('config/*.yaml')),
+        (os.path.join('share', package_name, 'models'),
+            [os.path.join('..', '..', 'best.pt')]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'vision_server = vision_target_server.vision_server:main',
+            'sim_target_server = vision_target_server.sim_target_server:main',
         ],
     },
 )

@@ -8,13 +8,15 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+from launch_ros.substitutions import FindPackageShare
+from launch.substitutions import PathJoinSubstitution
 
 
 def generate_launch_description():
-    orbbec_share = get_package_share_directory('orbbec_camera')
     vision_share = get_package_share_directory('vision_target_server')
     camera = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(orbbec_share, 'launch', 'gemini_330_series.launch.py')),
+        PythonLaunchDescriptionSource(PathJoinSubstitution([
+            FindPackageShare('orbbec_camera'), 'launch', 'gemini_330_series.launch.py'])),
         condition=IfCondition(LaunchConfiguration('start_camera')),
         launch_arguments={
             'camera_name': LaunchConfiguration('camera_name'),

@@ -71,7 +71,7 @@ OrbbecSDK_ROS2 使用官方仓库，不在本项目中维护修改版；首次�
 ```text
 Tomato-Orbbec-Vision/
 ├── README.md
-├── best.pt                              # 当前项目 YOLO 权重，路径由 vision.yaml 指定
+├── best.pt                              # 项目权重；构建时安装到 share/vision_target_server/models/
 │
 └── src/
     ├── OrbbecSDK_ROS2/                  # 官方依赖，git clone 获取
@@ -89,10 +89,13 @@ Tomato-Orbbec-Vision/
         ├── config/
         │   └── vision.yaml
         ├── launch/
-        │   └── vision_system.launch.py
+        │   ├── vision_system.launch.py
+        │   ├── vision_server.launch.py   # 仅视觉服务，不启动或查找 Orbbec 驱动
+        │   └── sim_targets.launch.py     # 运动学仿真目标
         └── vision_target_server/
             ├── detector.py
             ├── rgbd_projector.py
+            ├── sim_target_server.py
             └── vision_server.py
 ```
 
@@ -244,8 +247,8 @@ src/vision_target_server/config/vision.yaml
 | `depth_topic` | `/camera/depth/image_raw` | 已注册深度输入 |
 | `camera_info_topic` | `/camera/color/camera_info` | 彩色相机内参 |
 | `service_name` | `/vision/get_targets` | 唯一视觉应用接口 |
-| `model_path` | `/home/ubuntu/orbbec_ros2_ws/best.pt` | YOLO 权重绝对路径 |
-| `device` | `0` | CUDA GPU 0；无 CUDA 时改为 `cpu` |
+| `model_path` | 空字符串 | 通过 ament 定位已安装的项目 `models/best.pt`；非空值优先 |
+| `device` | `cpu` | 需要 CUDA 时显式设置设备编号 |
 | `default_confidence` | `0.40` | 请求未指定时的默认置信度 |
 | `default_max_frame_age_sec` | `0.50` | 默认允许的最大图像年龄 |
 | `min_depth_m` | `0.25` | 最小有效深度 |
@@ -253,12 +256,13 @@ src/vision_target_server/config/vision.yaml
 | `max_depth_mad_m` | `0.10` | 深度 MAD 稳定性阈值 |
 | `sample_radius_px` | `7` | 目标中心深度采样半径 |
 
-第一次运行前至少检查：
+构建前将项目训练的 `best.pt` 放在仓库根目录；构建会将它复制到包的 `share/vision_target_server/models/best.pt`，运行时不依赖源码绝对路径。权重不随 Git 提交；缺文件会使构建或启动明确失败，不会下载或回退到通用 YOLO 模型
+
+需要覆盖默认模型或设备时修改配置：
 
 ```yaml
-model_path: /path/to/best.pt
-device: "0"      # NVIDIA CUDA
-# device: "cpu"  # 无 CUDA 时使用
+model_path: ""    # 使用已安装的项目权重，也可写本地模型文件路径
+device: "cpu"    # NVIDIA CUDA 可改为 "0"
 ```
 
 当前仓库默认按单台 Orbbec 相机使用，不配置 `/dev/ttyUSB*` 或 `/dev/ttyACM*`；Gemini 335L 是 USB 相机，不是串口设备
@@ -329,6 +333,47 @@ vision_server
 ```
 
 应用层不会周期性发布目标 Topic，也不会持续运行 YOLO
+
+### 仅启动视觉服务
+
+已有 RGB、对齐深度与 CameraInfo 输入时，使用不依赖 Orbbec 包的入口：
+
+```bash
+ros2 launch vision_target_server vision_server.launch.py
+```
+
+可通过 `vision_config:=/absolute/path/vision.yaml` 覆盖配置；三个输入必须有一致的 optical frame、匹配的尺寸与有效采样时间戳。`use_sim_time` 默认 `false`；播放 rosbag 时应使发布方与服务使用相同的时钟
+
+### 运动学仿真目标
+
+第一阶段仿真使用同一 `GetTargets` 接口，不加载 YOLO 或相机驱动；机械臂由 Robot 的仿真入口另行启动。服务持续按 30 Hz 采样机械臂 TF，返回缓存采样的时间戳，不把请求时间写成图像时间
+
+```bash
+ros2 launch vision_target_server sim_targets.launch.py \
+  calibration_file:=/absolute/path/handeye.yaml
+```
+
+直接运行 `ros2 run vision_target_server sim_target_server --ros-args -p calibration_file:=/absolute/path/handeye.yaml` 也可使用相同参数。保持 `use_sim_time=false`，并与机械臂及编排程序使用同一个 `ROS_DOMAIN_ID`
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `calibration_file` | 必填 | `camera_to_gripper (^gripper T_camera)` 手眼外参文件 |
+| `world_frame` / `tool_frame` / `tcp_frame` | `base_link` / `tool0` / `tip` | 世界、外参父系与 TCP |
+| `camera_frame` | `camera_color_optical_frame` | 返回坐标系，必须匹配外参子系 |
+| `initial_target_distance_m` | `0.30` | 首次 TF 下沿 TCP 局部 Z 放置果实，随后世界位置固定 |
+| `world_target` | `[]` | 可覆盖为世界坐标 `[x, y, z]`，单位 m；通过 ROS 参数或 `sim_config` 文件传入 |
+| `sample_rate_hz` | `30.0` | 独立于查询的 TF 采样频率 |
+| `confidence` / `default_confidence` | `0.95` / `0.40` | 模拟置信度与请求默认阈值 |
+| `default_max_frame_age_sec` | `0.50` | 请求未指定时的最大帧年龄 |
+| `service_name` | `/vision/get_targets` | 与真实视觉相同的接口 |
+| `dropout_start_request` / `dropout_requests` | `2` / `0` | 从第几次有效查询起连续返回几次空目标，0 为关闭 |
+| `ambiguous_start_request` / `ambiguous_requests` | `2` / `0` | 从第几次有效查询起连续返回两个相距 10 mm 的成熟果，0 为关闭 |
+
+`sim_targets.launch.py` 支持表中标量 launch 参数；`sim_config:=/absolute/path/sim.yaml` 可提供完整 ROS 参数文件。将 `dropout_requests:=2` 或 `ambiguous_requests:=2` 用于短暂漏检或关联歧义；将 `initial_target_distance_m:=0.50` 用于首次行程预算拒绝场景。请求计数从节点启动后第一次成功且新鲜的查询开始，因此修改场景后应重启该模块，再运行完整流程
+
+固定果实以 `visualization_msgs/msg/Marker` 发布到 `/simulation/targets`，可在 RViz 添加 Marker 显示。模拟目标没有渲染图像，像素、bbox 与深度 MAD 字段保持零值；该入口覆盖 TF、关联与运动闭环，RGB-D/YOLO 仍使用真实视觉服务
+
+服务存在可作为节点就绪探测；目标可用需等待带时间戳的 `world_frame → tool_frame` 与 `world_frame → tcp_frame` TF。尚无样本返回 `NO_FRAME`，停止更新后返回 `STALE_FRAME`，正常漏检返回 `success=true` 的空目标；类别和置信度过滤与真实服务一致
 
 ## Service API
 
