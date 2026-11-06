@@ -23,7 +23,7 @@ from std_msgs.msg import Header
 from tf2_ros import Buffer, TransformException, TransformListener
 from vision_interfaces.msg import TargetPoint
 from vision_interfaces.srv import GetTargets, ManageHarvest
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
 import yaml
 
 
@@ -46,6 +46,42 @@ def transform_matrix(transform):
     if not np.isfinite(matrix).all():
         raise ValueError('TF translation must be finite')
     return matrix
+
+
+def parse_harvest_basket(config):
+    """Read the basket contract shared with the simulation collision scene."""
+    if not isinstance(config, dict) or not isinstance(config.get('frame_id'), str) or not config['frame_id'].strip():
+        raise ValueError('Harvest scene requires a nonempty frame_id')
+    basket = config.get('basket')
+    if not isinstance(basket, dict) or not isinstance(basket.get('id'), str) or not basket['id'].strip():
+        raise ValueError('Harvest scene requires a basket with a nonempty id')
+    result = {'frame_id': config['frame_id'], 'id': basket['id']}
+    for key in ('position', 'dimensions'):
+        values = basket.get(key)
+        if (not isinstance(values, list) or len(values) != 3 or
+                any(type(value) not in (int, float) or not math.isfinite(value) for value in values)):
+            raise ValueError(f'Basket {key} must contain three finite numbers')
+        if key == 'dimensions' and any(value <= 0 for value in values):
+            raise ValueError('Basket dimensions must be positive')
+        result[key] = [float(value) for value in values]
+    if basket.get('slot_axis') not in ('x_axis', 'y_axis'):
+        raise ValueError('Basket slot_axis must be x_axis or y_axis')
+    result['slot_axis'] = basket['slot_axis']
+    orientation = basket.get('release_orientation_xyzw')
+    if (not isinstance(orientation, list) or len(orientation) != 4 or
+            any(type(value) not in (int, float) or not math.isfinite(value) for value in orientation)):
+        raise ValueError('Basket release_orientation_xyzw must contain four finite numbers')
+    norm = math.sqrt(sum(value * value for value in orientation))
+    if abs(norm - 1.) > .01:
+        raise ValueError('Basket release_orientation_xyzw must be normalized')
+    result['release_orientation_xyzw'] = [float(value) / norm for value in orientation]
+    for key in ('slot_spacing_m', 'release_clearance_m'):
+        value = basket.get(key)
+        if (type(value) not in (int, float) or not math.isfinite(value) or value < 0 or
+                key == 'slot_spacing_m' and value == 0):
+            raise ValueError(f'Basket {key} must be finite and {"positive" if key == "slot_spacing_m" else "nonnegative"}')
+        result[key] = float(value)
+    return result
 
 
 @dataclass(frozen=True)
@@ -76,8 +112,11 @@ class SimTargetServer(Node):
             'ambiguous_requests': 0,
             'harvest_mode': False,
             'harvest_service_name': '/simulation/harvest',
+            'harvest_scene_file': '',
             'fruit_offsets_m': [-.055, 0., .10, 0., 0., .12, .055, 0., .10],
-            'basket_offset_m': [0., -.04, 0.],
+            'basket_offset_frame': 'world',
+            'basket_offset_m': [.20, .05, -.06],
+            'basket_slot_axis': 'x_axis',
             'grasp_tolerance_m': .006,
             'release_tolerance_m': .01,
             'retreat_distance_m': .10,
@@ -113,9 +152,21 @@ class SimTargetServer(Node):
         if offsets.ndim != 1 or offsets.size == 0 or offsets.size % 3 or not np.isfinite(offsets).all():
             raise ValueError('fruit_offsets_m must contain one or more finite local XYZ triples')
         self._fruit_offsets = offsets.reshape((-1, 3))
+        self._basket_offset_frame = self.get_parameter('basket_offset_frame').value
+        if self._basket_offset_frame not in ('world', 'tcp'):
+            raise ValueError('basket_offset_frame must be world or tcp')
         self._basket_offset = np.asarray(self.get_parameter('basket_offset_m').value, dtype=float)
         if self._basket_offset.shape != (3,) or not np.isfinite(self._basket_offset).all():
-            raise ValueError('basket_offset_m must contain three finite local coordinates')
+            raise ValueError('basket_offset_m must contain three finite coordinates')
+        self._basket_slot_axis = self.get_parameter('basket_slot_axis').value
+        if self._basket_slot_axis not in ('x_axis', 'y_axis'):
+            raise ValueError('basket_slot_axis must be x_axis or y_axis')
+        self._harvest_basket = None
+        scene_file = self.get_parameter('harvest_scene_file').value
+        if scene_file:
+            self._harvest_basket = parse_harvest_basket(yaml.safe_load(Path(scene_file).expanduser().read_text()))
+            if self._harvest_basket['frame_id'] != self._world_frame:
+                raise ValueError('Harvest scene frame_id must match world_frame')
         calibration_path = Path(self.get_parameter('calibration_file').value).expanduser()
         if not calibration_path.is_file():
             raise FileNotFoundError(f'calibration_file does not exist: {calibration_path}')
@@ -146,12 +197,15 @@ class SimTargetServer(Node):
         self._held_index = None
         self._attached_offset = None
         self._harvest_phase = 'Waiting for initial TCP'
+        self._harvest_marker_reset_pending = True
         self._sample = None
         self._requests = 0
         self._tf = Buffer()
         self._listener = TransformListener(self._tf, self)
         self._markers = self.create_publisher(
             Marker, '/simulation/targets', QoSProfile(depth=64, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._marker_frames = self.create_publisher(
+            MarkerArray, '/simulation/targets_array', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._timer = self.create_timer(1. / self.get_parameter('sample_rate_hz').value, self._sample_frame)
         self._service = self.create_service(
             GetTargets, self.get_parameter('service_name').value, self._get_targets)
@@ -170,11 +224,12 @@ class SimTargetServer(Node):
             world_tcp = self._tf.lookup_transform(
                 self._world_frame, self._tcp_frame, Time.from_msg(stamp))
             self._latest_tcp = transform_matrix(world_tcp.transform)
-            if self._initial_tcp is None:
+            if self._initial_tcp is None and not self._harvest_mode:
                 self._initial_tcp = self._latest_tcp.copy()
                 self._initial_orientation = deepcopy(world_tcp.transform.rotation)
-                if self._harvest_mode:
-                    self._reset_harvest()
+            if self._initial_tcp is None:
+                # The harvest workflow anchors its scene after unfolding to the observation pose.
+                return
             if self._world_target is None or self._world_ambiguity_offset is None:
                 if self._world_target is None and not self._harvest_mode:
                     distance = float(self.get_parameter('initial_target_distance_m').value)
@@ -230,6 +285,7 @@ class SimTargetServer(Node):
         self._sample = None
         self._requests = 0
         self._harvest_phase = 'Ready to select fruit'
+        self._harvest_marker_reset_pending = True
 
     def _pose(self, point, stamp):
         pose = PoseStamped()
@@ -240,8 +296,19 @@ class SimTargetServer(Node):
 
     def _place_point(self, index):
         # Separate slots make each successful release visible in the basket
+        if self._harvest_basket is not None:
+            basket = self._harvest_basket
+            point = np.array([*basket['position'], 1.])
+            point[2] += basket['dimensions'][2] / 2. + .025 + basket['release_clearance_m']
+            point[0 if basket['slot_axis'] == 'x_axis' else 1] += (
+                index - (len(self._fruits) - 1) / 2.) * basket['slot_spacing_m']
+            return point
         offset = self._basket_offset.copy()
-        offset[0] += (index - (len(self._fruits) - 1) / 2.) * .055
+        offset[0 if self._basket_slot_axis == 'x_axis' else 1] += (index - (len(self._fruits) - 1) / 2.) * .055
+        if self._basket_offset_frame == 'world':
+            point = self._initial_tcp[:, 3].copy()
+            point[:3] += offset
+            return point
         return self._initial_tcp @ [*offset, 1.]
 
     def _fill_harvest_response(self, response, stamp):
@@ -256,6 +323,9 @@ class SimTargetServer(Node):
             retreat[:3] -= self._initial_tcp[:3, 2] * self.get_parameter('retreat_distance_m').value
         response.retreat_pose = self._pose(retreat, stamp)
         response.place_pose = self._pose(self._place_point(index or 0), stamp)
+        if self._harvest_basket is not None:
+            orientation = response.place_pose.pose.orientation
+            orientation.x, orientation.y, orientation.z, orientation.w = self._harvest_basket['release_orientation_xyzw']
         return response
 
     def _manage_harvest(self, request, response):
@@ -263,14 +333,27 @@ class SimTargetServer(Node):
         if not self._harvest_mode:
             response.message = 'Harvest commands require harvest_mode=true'
             return response
-        if self._initial_tcp is None:
-            response.message = 'No stamped initial TCP is available yet'
+        if self._latest_tcp is None:
+            response.message = 'No stamped TCP is available yet'
             return response
         stamp = self.get_clock().now().to_msg()
         if request.command == ManageHarvest.Request.RESET:
-            self._reset_harvest()
-            response.success = True
-            response.message = 'Harvest scene reset from the initial TCP reference'
+            try:
+                world_tcp, current_tcp = self._fresh_tcp()
+                stamp = world_tcp.header.stamp
+                self._initial_tcp = current_tcp.copy()
+                self._latest_tcp = current_tcp
+                self._initial_orientation = deepcopy(world_tcp.transform.rotation)
+                self._world_ambiguity_offset = self._initial_tcp[:3, 0] * .01
+                self._reset_harvest()
+                response.success = True
+                response.message = 'Harvest scene anchored at the measured observation TCP'
+            except (TransformException, ValueError) as error:
+                response.message = str(error)
+                return response
+        elif self._initial_tcp is None:
+            response.message = 'Reset the harvest scene after reaching the observation pose'
+            return response
         elif request.command == ManageHarvest.Request.SELECT_NEXT:
             if self._held_index is not None:
                 response.message = 'Release the attached fruit before selecting another fruit'
@@ -285,13 +368,8 @@ class SimTargetServer(Node):
                 self._sample = None
         elif request.command in (ManageHarvest.Request.GRASP, ManageHarvest.Request.RELEASE):
             try:
-                world_tcp = self._tf.lookup_transform(self._world_frame, self._tcp_frame, Time())
+                world_tcp, current_tcp = self._fresh_tcp()
                 stamp = world_tcp.header.stamp
-                source_ns = stamp.sec * 10**9 + stamp.nanosec
-                age = (self.get_clock().now().nanoseconds - source_ns) / 1e9
-                if source_ns == 0 or age < -.05 or age > self.get_parameter('default_max_frame_age_sec').value:
-                    raise ValueError('A fresh stamped TCP is required for grasp/release')
-                current_tcp = transform_matrix(world_tcp.transform)
                 self._latest_tcp = current_tcp
                 self._apply_harvest_command(request.command, current_tcp, response)
             except (TransformException, ValueError) as error:
@@ -300,6 +378,15 @@ class SimTargetServer(Node):
             response.message = f'Unknown harvest command: {request.command}'
         self._publish_harvest_markers(stamp)
         return self._fill_harvest_response(response, stamp)
+
+    def _fresh_tcp(self):
+        world_tcp = self._tf.lookup_transform(self._world_frame, self._tcp_frame, Time())
+        stamp = world_tcp.header.stamp
+        source_ns = stamp.sec * 10**9 + stamp.nanosec
+        age = (self.get_clock().now().nanoseconds - source_ns) / 1e9
+        if source_ns == 0 or age < -.05 or age > self.get_parameter('default_max_frame_age_sec').value:
+            raise ValueError('A fresh stamped TCP is required for harvest commands')
+        return world_tcp, transform_matrix(world_tcp.transform)
 
     def _apply_harvest_command(self, command, current_tcp, response):
         index = self._selected_index
@@ -326,7 +413,11 @@ class SimTargetServer(Node):
             if distance > self.get_parameter('release_tolerance_m').value:
                 response.message = f'TCP is {distance * 1000:.1f} mm from basket slot; release rejected'
                 return
-            self._fruits[index] = current_tcp @ self._attached_offset
+            released = current_tcp @ self._attached_offset
+            if self._harvest_basket is not None:
+                basket = self._harvest_basket
+                released[2] = basket['position'][2] + basket['dimensions'][2] / 2. + .025
+            self._fruits[index] = released
             self._fruit_states[index] = 'harvested'
             self._held_index = None
             self._attached_offset = None
@@ -352,30 +443,51 @@ class SimTargetServer(Node):
     def _publish_harvest_markers(self, stamp):
         if self._initial_tcp is None:
             return
+        markers = []
+        if self._harvest_marker_reset_pending:
+            for namespace in ('ripe_targets', 'harvest_fruits', 'harvest_fruit_labels',
+                              'harvest_basket', 'harvest_tcp', 'harvest_goals', 'harvest_status'):
+                clear = self._marker(namespace, -1, Marker.CUBE, self._initial_tcp[:, 3],
+                                     (0., 0., 0.), (0., 0., 0., 0.), stamp)
+                clear.action = Marker.DELETEALL
+                markers.append(clear)
         for index, fruit in enumerate(self._fruits):
             state = self._fruit_states[index]
             point = (self._latest_tcp @ self._attached_offset
                      if index == self._held_index and self._latest_tcp is not None else fruit)
             color = ((.2, .85, .25, 1.) if state == 'harvested' else
                      (1., .65, .05, 1.) if index == self._selected_index else (.9, .1, .05, 1.))
-            self._markers.publish(self._marker(
+            markers.append(self._marker(
                 'harvest_fruits', index, Marker.SPHERE, point, (.05, .05, .05), color, stamp))
             label_position = point.copy()
             label_position[2] += .045
+            if state == 'harvested':
+                label_position[2] += index * .06
+            # Humble keeps the default one-metre text's space width unless scale.x is explicit.
             label = self._marker('harvest_fruit_labels', index, Marker.TEXT_VIEW_FACING,
-                                 label_position, (0., 0., .022), (1., 1., 1., 1.), stamp)
+                                 label_position, (.011, 0., .022), (1., 1., 1., 1.), stamp)
             label.text = f'Fruit {index + 1}: {state}'
-            self._markers.publish(label)
-        basket = self._initial_tcp @ [*self._basket_offset, 1.]
-        basket[:3] -= self._initial_tcp[:3, 2] * .04
+            markers.append(label)
+        if self._harvest_basket is not None:
+            basket = self._harvest_basket['position']
+            basket_scale = self._harvest_basket['dimensions']
+        else:
+            basket = self._place_point((len(self._fruits) - 1) / 2.)
+            if self._basket_offset_frame == 'world':
+                # A 50 mm fruit rests on the top of the 25 mm basket base.
+                basket[2] -= .0375
+            else:
+                basket[:3] -= self._initial_tcp[:3, 2] * .04
+            basket_scale = (.16, .11, .025) if self._basket_slot_axis == 'x_axis' else (.11, .16, .025)
         basket_marker = self._marker('harvest_basket', 0, Marker.CUBE, basket,
-                                     (.16, .11, .025), (.2, .55, .85, .55), stamp)
-        basket_marker.pose.orientation = deepcopy(self._initial_orientation)
-        self._markers.publish(basket_marker)
+                                     basket_scale, (.2, .55, .85, .55), stamp)
+        if self._harvest_basket is None and self._basket_offset_frame == 'tcp':
+            basket_marker.pose.orientation = deepcopy(self._initial_orientation)
+        markers.append(basket_marker)
         if self._latest_tcp is not None:
-            self._markers.publish(self._marker('harvest_tcp', 0, Marker.SPHERE,
-                                               self._latest_tcp[:, 3], (.012, .012, .012),
-                                               (.1, .8, 1., 1.), stamp))
+            markers.append(self._marker('harvest_tcp', 0, Marker.SPHERE,
+                                        self._latest_tcp[:, 3], (.012, .012, .012),
+                                        (.1, .8, 1., 1.), stamp))
         for marker_id in (0, 1):
             goal = self._marker('harvest_goals', marker_id,
                                 Marker.SPHERE if marker_id == 0 else Marker.LINE_LIST,
@@ -396,17 +508,20 @@ class SimTargetServer(Node):
                 if marker_id == 0:
                     point[:3] -= self._initial_tcp[:3, 2] * self.get_parameter('standoff_m').value
                 goal.pose.position.x, goal.pose.position.y, goal.pose.position.z = map(float, point[:3])
-            self._markers.publish(goal)
+            markers.append(goal)
         phase_position = self._initial_tcp[:, 3].copy()
         phase_position[2] += .22
         phase = self._marker('harvest_status', 0, Marker.TEXT_VIEW_FACING, phase_position,
-                             (0., 0., .025), (1., 1., 1., 1.), stamp)
+                             (.0125, 0., .025), (1., 1., 1., 1.), stamp)
         phase.text = (f'{self._harvest_phase}\nCollected: '
                       f'{self._fruit_states.count("harvested")}/{len(self._fruits)}')
         if self._selected_index is not None and self._held_index is None and self._latest_tcp is not None:
             distance = np.linalg.norm(self._latest_tcp[:3, 3] - self._fruits[self._selected_index][:3])
             phase.text += f'\nTCP to fruit: {distance * 1000:.1f} mm'
-        self._markers.publish(phase)
+        markers.append(phase)
+        # One DDS sample keeps fruit, labels and progress in the same scene snapshot.
+        self._marker_frames.publish(MarkerArray(markers=markers))
+        self._harvest_marker_reset_pending = False
 
     @staticmethod
     def _error(response, code, message):

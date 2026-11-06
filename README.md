@@ -378,24 +378,39 @@ ros2 launch vision_target_server sim_targets.launch.py \
 
 ### 多果实采摘场景
 
-设置 `harvest_mode:=true` 后，`/simulation/harvest` 提供 `vision_interfaces/srv/ManageHarvest`，控制固定在首次 TCP 参考系中的果实与篮子；实际机械臂规划、运动和末端执行器指令由 Robot 流程编排负责
+设置 `harvest_mode:=true` 后，`/simulation/harvest` 提供 `vision_interfaces/srv/ManageHarvest`，在机械臂到达观察位后调用 `RESET`，以该时刻的新鲜实测 TCP 建立固定果实场景；配置 `harvest_scene_file` 时，篮位使用共享文件中的绝对世界坐标；实际机械臂规划、运动和末端执行器指令由 Robot 流程编排负责
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `harvest_mode` | `false` | 保留原单目标模式；启用后只向视觉查询返回当前选中果实 |
-| `fruit_offsets_m` | `[-0.055,0,0.10, 0,0,0.12, 0.055,0,0.10]` | 依次排列的 XYZ，单位 m，相对首次 TCP；通过 `sim_config` 传入 |
-| `basket_offset_m` | `[0,-0.04,0]` | 篮子中心相对首次 TCP；各果实有间距 55 mm 的独立放置槽位；通过 `sim_config` 传入 |
+| `fruit_offsets_m` | `[-0.055,0,0.10, 0,0,0.12, 0.055,0,0.10]` | 依次排列的 XYZ，单位 m，相对 `RESET` 记录的观察位 TCP；通过 `sim_config` 传入 |
+| `harvest_scene_file` | 空字符串 | 共享采摘场景 YAML，定义世界坐标系、篮底中心与尺寸、槽向与槽距、释放姿态和间隙；与 MoveIt 场景节点使用同一文件；配置后覆盖下面三个相对篮位参数 |
+| `basket_offset_frame` | `world` | `world` 使用世界坐标轴并保持篮底水平；`tcp` 使用 `RESET` 记录的观察位 TCP 坐标轴与姿态，供旧场景显式选择；通过 `sim_config` 传入 |
+| `basket_offset_m` | `[0.20,0.05,-0.06]` | 放果中心相对 `RESET` 记录的观察位 TCP 原点的 XYZ 偏移，单位 m，坐标轴由 `basket_offset_frame` 决定；各果实沿 `basket_slot_axis` 指定的轴间隔 55 mm；通过 `sim_config` 传入 |
+| `basket_slot_axis` | `x_axis` | 使用 `x_axis` 或 `y_axis` 指定篮槽沿所选坐标系的 X 或 Y 轴排列，槽间距 55 mm，篮底长边随排列轴调整 |
 | `standoff_m` | `0.08` | RViz 中预接近点距果实中心的距离 |
-| `retreat_distance_m` | `0.10` | 撤离点距果实中心的距离，沿首次 TCP 的负 Z |
+| `retreat_distance_m` | `0.10` | 撤离点距果实中心的距离，沿 `RESET` 记录的观察位 TCP 的负 Z |
 | `grasp_tolerance_m` | `0.006` | 实测 TCP 距果实中心的最大夹取距离 |
 | `release_tolerance_m` | `0.01` | 实测 TCP 距对应篮子槽位的最大释放距离 |
 | `harvest_service_name` | `/simulation/harvest` | 场景服务名称 |
 
-流程依次调用 `RESET → SELECT_NEXT → GRASP → RELEASE`，每次释放后再次 `SELECT_NEXT`，直至 `finished=true`；`RESET` 从同一个首次 TCP 参考重建场景，取消后可重新开始；`fruit_index` 从 1 起算，0 表示未选中，响应同时给出总果数、入篮数、初始位姿、撤离位姿和当前果实的放置位姿
+Robot 的连续采摘仿真工程将 `retreat_distance_m` 覆盖为 `0.06`，并将 `standoff_m` 覆盖为 `0.02`，对应一段连续预接近后的 20 mm 果前停距；表中 `0.08` 仍为视觉节点单独启动时的默认显示值，实际预接近与末段修正距离由 Robot 的流程任务配置决定
+
+该静态运动学仿真工程还将节点和查询的观测有效期覆盖为 3 秒，与坐标变换及目标计算的调度预算一致；样本仍保留真实 TF 采样时间，Robot 仍要求运动停止后的新采样和夹取前连续 3 个新帧确认，真实视觉配置保持独立
+
+流程依次调用 `RESET → SELECT_NEXT → GRASP → RELEASE`，每次释放后再次 `SELECT_NEXT`，直至 `finished=true`；`RESET` 重新记录当前观察位 TCP 并重建场景，取消后可重新开始；`fruit_index` 从 1 起算，0 表示未选中，响应同时给出总果数、入篮数、观察位姿、撤离位姿和当前果实的放置位姿
+
+Robot 完整流程使用 `Bringup/src/robot-profile-sim/assets/harvest_scene.yaml`，篮底在机器人侧方，与 MoveIt BOX 采用相同中心和尺寸；三果沿观察位 TCP 的局部 Y 轴竖排，放果时使用共享文件中的专属工具姿态，撤离位和观察位保留观测姿态
+
+共享文件的 `basket.position` 是水平篮底的中心，`dimensions` 为 XYZ 尺寸，`slot_axis` 和 `slot_spacing_m` 指定各槽位，`release_orientation_xyzw` 为放果工具四元数；释放 TCP 高度为篮底中心 Z 加半厚度、25 mm 果实半径及 `release_clearance_m`，工具到位释放后果实保留实际 XY，并落至篮底上表面；未配置共享文件时沿用相对篮位参数
 
 `GRASP` 只在新鲜实测 TCP 距选中果实满足夹取容差时附着果实；附着后果实随实际 TCP 的位置与姿态运动；`RELEASE` 只在已附着且 TCP 到达对应篮子槽位后增加入篮计数，失败保留原场景状态；这是运动学夹取与释放仿真，不包含物理接触、夹持力或番茄脱离枝梗的动力学
 
-RViz 的 `/simulation/targets` 同时显示全部果实、选中项、青色 TCP、青色预接近点、黄色采摘中心、蓝色篮子与各果实状态标签；入篮后果实变绿；Marker 使用稳定 ID 与 Transient Local，可在流程开始后再打开 RViz
+多果场景将全部果实、标签、TCP、目标点、篮子与计数作为一帧 `MarkerArray` 发布到 `/simulation/targets_array`，避免逐条 Marker 更新时球体、标签与计数处在不同场景帧；GRASP 与 RELEASE 返回前立即发布新状态，入篮后果实变绿，标签按果号错开高度
+
+RViz Humble 的 `Marker` 显示在订阅 `/simulation/targets` 时会自动订阅 `/simulation/targets_array`，已有显示配置可继续使用；也可直接添加 `MarkerArray` 显示订阅新话题；整帧使用 Transient Local、深度 1，可在流程开始后打开 RViz，RESET 会清理本仿真命名空间的旧标记；非多果模式仍使用原 `/simulation/targets` 单目标 `Marker`
+
+多果场景在 `RESET` 前不固定果实位置；`home_pose` 始终表示本轮场景的参考观察位，逐果关节返回和最终回零由 Robot 流程定义
 
 ## Service API
 
