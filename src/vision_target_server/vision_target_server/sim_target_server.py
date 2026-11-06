@@ -17,8 +17,9 @@ from geometry_msgs.msg import Point, PoseStamped
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Header
 from tf2_ros import Buffer, TransformException, TransformListener
 from vision_interfaces.msg import TargetPoint
@@ -119,6 +120,11 @@ class SimTargetServer(Node):
             'basket_slot_axis': 'x_axis',
             'grasp_tolerance_m': .006,
             'release_tolerance_m': .01,
+            'gripper_open_positions_m': [0., 0.],
+            'gripper_closed_positions_m': [-.007145, -.007145],
+            'gripper_grasp_min_close_fraction': .97,
+            'gripper_open_tolerance_fraction': .03,
+            'gripper_feedback_max_age_sec': .50,
             'retreat_distance_m': .10,
             'standoff_m': .08,
         }
@@ -128,7 +134,8 @@ class SimTargetServer(Node):
         if self.get_parameter('use_sim_time').value:
             raise ValueError('Kinematic simulation requires use_sim_time=false')
         for name in ('sample_rate_hz', 'initial_target_distance_m', 'default_max_frame_age_sec',
-                     'grasp_tolerance_m', 'release_tolerance_m', 'retreat_distance_m', 'standoff_m'):
+                     'grasp_tolerance_m', 'release_tolerance_m', 'retreat_distance_m', 'standoff_m',
+                     'gripper_feedback_max_age_sec'):
             value = float(self.get_parameter(name).value)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be finite and positive')
@@ -142,6 +149,21 @@ class SimTargetServer(Node):
         for name in ('dropout_requests', 'ambiguous_requests'):
             if self.get_parameter(name).value < 0:
                 raise ValueError(f'{name} must be nonnegative')
+        self._gripper_open = np.asarray(self.get_parameter('gripper_open_positions_m').value, dtype=float)
+        self._gripper_closed = np.asarray(self.get_parameter('gripper_closed_positions_m').value, dtype=float)
+        for name, values in (('gripper_open_positions_m', self._gripper_open),
+                             ('gripper_closed_positions_m', self._gripper_closed)):
+            if values.shape != (2,) or not np.isfinite(values).all():
+                raise ValueError(f'{name} must contain two finite positions for joint7-1 and joint7-2')
+        if np.any(np.isclose(self._gripper_open, self._gripper_closed, atol=1e-9)):
+            raise ValueError('Gripper open and closed positions must differ for each finger')
+        for name in ('gripper_grasp_min_close_fraction', 'gripper_open_tolerance_fraction'):
+            value = float(self.get_parameter(name).value)
+            if not math.isfinite(value) or not 0 < value < 1:
+                raise ValueError(f'{name} must be in (0, 1)')
+        if (self.get_parameter('gripper_open_tolerance_fraction').value >=
+                self.get_parameter('gripper_grasp_min_close_fraction').value):
+            raise ValueError('Gripper open tolerance must be below the grasp close fraction')
 
         self._world_frame = self.get_parameter('world_frame').value
         self._tool_frame = self.get_parameter('tool_frame').value
@@ -199,9 +221,13 @@ class SimTargetServer(Node):
         self._harvest_phase = 'Waiting for initial TCP'
         self._harvest_marker_reset_pending = True
         self._sample = None
+        self._gripper_states = {}
         self._requests = 0
         self._tf = Buffer()
         self._listener = TransformListener(self._tf, self)
+        if self._harvest_mode:
+            self._gripper_subscription = self.create_subscription(
+                JointState, '/joint_states', self._gripper_feedback, qos_profile_sensor_data)
         self._markers = self.create_publisher(
             Marker, '/simulation/targets', QoSProfile(depth=64, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self._marker_frames = self.create_publisher(
@@ -388,6 +414,45 @@ class SimTargetServer(Node):
             raise ValueError('A fresh stamped TCP is required for harvest commands')
         return world_tcp, transform_matrix(world_tcp.transform)
 
+    def _gripper_feedback(self, message):
+        source_ns = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
+        received_ns = time.monotonic_ns()
+        for index, name in enumerate(message.name):
+            if name not in ('joint7-1', 'joint7-2'):
+                continue
+            if index >= len(message.position) or not math.isfinite(message.position[index]):
+                self._gripper_states.pop(name, None)
+                continue
+            self._gripper_states[name] = (message.position[index], source_ns, received_ns)
+
+    def _check_gripper(self, grasping):
+        """Require measured finger travel before changing fruit ownership."""
+        positions = []
+        now_ns = self.get_clock().now().nanoseconds
+        received_ns = time.monotonic_ns()
+        max_age = self.get_parameter('gripper_feedback_max_age_sec').value
+        for name in ('joint7-1', 'joint7-2'):
+            sample = self._gripper_states.get(name)
+            if sample is None:
+                raise ValueError(f'Missing gripper feedback for {name}; harvest command rejected')
+            position, source_ns, arrival_ns = sample
+            source_age = (now_ns - source_ns) / 1e9
+            arrival_age = (received_ns - arrival_ns) / 1e9
+            if source_ns == 0 or source_age < -.05 or source_age > max_age or arrival_age > max_age:
+                raise ValueError(f'Stale gripper feedback for {name}; harvest command rejected')
+            positions.append(position)
+        fractions = ((np.asarray(positions) - self._gripper_open) /
+                     (self._gripper_closed - self._gripper_open))
+        tolerance = self.get_parameter('gripper_open_tolerance_fraction').value
+        if np.any(fractions < -tolerance) or np.any(fractions > 1. + tolerance):
+            raise ValueError('Gripper feedback is outside the calibrated finger travel; harvest command rejected')
+        if grasping:
+            minimum = self.get_parameter('gripper_grasp_min_close_fraction').value
+            if np.any(fractions < minimum):
+                raise ValueError('Both fingers must reach the grasp position before attaching fruit')
+        elif np.any(np.abs(fractions) > tolerance):
+            raise ValueError('Both fingers must be open before releasing fruit')
+
     def _apply_harvest_command(self, command, current_tcp, response):
         index = self._selected_index
         if command == ManageHarvest.Request.GRASP:
@@ -398,6 +463,7 @@ class SimTargetServer(Node):
             if distance > self.get_parameter('grasp_tolerance_m').value:
                 response.message = f'TCP is {distance * 1000:.1f} mm from fruit; grasp rejected'
                 return
+            self._check_gripper(grasping=True)
             self._held_index = index
             self._attached_offset = np.linalg.inv(current_tcp) @ self._fruits[index]
             self._fruit_states[index] = 'attached'
@@ -413,6 +479,7 @@ class SimTargetServer(Node):
             if distance > self.get_parameter('release_tolerance_m').value:
                 response.message = f'TCP is {distance * 1000:.1f} mm from basket slot; release rejected'
                 return
+            self._check_gripper(grasping=False)
             released = current_tcp @ self._attached_offset
             if self._harvest_basket is not None:
                 basket = self._harvest_basket

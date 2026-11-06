@@ -392,19 +392,26 @@ ros2 launch vision_target_server sim_targets.launch.py \
 | `retreat_distance_m` | `0.10` | 撤离点距果实中心的距离，沿 `RESET` 记录的观察位 TCP 的负 Z |
 | `grasp_tolerance_m` | `0.006` | 实测 TCP 距果实中心的最大夹取距离 |
 | `release_tolerance_m` | `0.01` | 实测 TCP 距对应篮子槽位的最大释放距离 |
+| `gripper_open_positions_m` | `[0.0, 0.0]` | `joint7-1`、`joint7-2` 的张开位置，单位 m，顺序固定；通过 `sim_config` 传入 |
+| `gripper_closed_positions_m` | `[-0.007145, -0.007145]` | 两夹指夹持 50 mm 果实的位置，分别按 Robot 仿真模型校准，单位 m；通过 `sim_config` 传入 |
+| `gripper_grasp_min_close_fraction` | `0.97` | 两指从张开位到夹持位的归一化闭合进度均达到此值，才允许附着果实 |
+| `gripper_open_tolerance_fraction` | `0.03` | 两指距张开位置的归一化行程容差；释放前均须满足 |
+| `gripper_feedback_max_age_sec` | `0.50` | 双指 `/joint_states` 时间戳与接收时间的最大年龄；不随视觉帧有效期放宽 |
 | `harvest_service_name` | `/simulation/harvest` | 场景服务名称 |
 
 Robot 的连续采摘仿真工程将 `retreat_distance_m` 覆盖为 `0.06`，并将 `standoff_m` 覆盖为 `0.02`，对应一段连续预接近后的 20 mm 果前停距；表中 `0.08` 仍为视觉节点单独启动时的默认显示值，实际预接近与末段修正距离由 Robot 的流程任务配置决定
 
 该静态运动学仿真工程还将节点和查询的观测有效期覆盖为 3 秒，与坐标变换及目标计算的调度预算一致；样本仍保留真实 TF 采样时间，Robot 仍要求运动停止后的新采样和夹取前连续 3 个新帧确认，真实视觉配置保持独立
 
-流程依次调用 `RESET → SELECT_NEXT → GRASP → RELEASE`，每次释放后再次 `SELECT_NEXT`，直至 `finished=true`；`RESET` 重新记录当前观察位 TCP 并重建场景，取消后可重新开始；`fruit_index` 从 1 起算，0 表示未选中，响应同时给出总果数、入篮数、观察位姿、撤离位姿和当前果实的放置位姿
+Robot 流程先确认夹爪张开，再依次调用 `RESET → SELECT_NEXT`，接近果实后下发闭爪并等待到位，再调用 `GRASP`；搬运到篮槽后先张开并等待到位，再调用 `RELEASE`；每次释放后再次 `SELECT_NEXT`，直至 `finished=true`；`RESET` 重新记录当前观察位 TCP 并重建场景，取消后可重新开始；`fruit_index` 从 1 起算，0 表示未选中，响应同时给出总果数、入篮数、观察位姿、撤离位姿和当前果实的放置位姿
 
 Robot 完整流程使用 `Bringup/src/robot-profile-sim/assets/harvest_scene.yaml`，篮底在机器人侧方，与 MoveIt BOX 采用相同中心和尺寸；三果沿观察位 TCP 的局部 Y 轴竖排，放果时使用共享文件中的专属工具姿态，撤离位和观察位保留观测姿态
 
 共享文件的 `basket.position` 是水平篮底的中心，`dimensions` 为 XYZ 尺寸，`slot_axis` 和 `slot_spacing_m` 指定各槽位，`release_orientation_xyzw` 为放果工具四元数；释放 TCP 高度为篮底中心 Z 加半厚度、25 mm 果实半径及 `release_clearance_m`，工具到位释放后果实保留实际 XY，并落至篮底上表面；未配置共享文件时沿用相对篮位参数
 
-`GRASP` 只在新鲜实测 TCP 距选中果实满足夹取容差时附着果实；附着后果实随实际 TCP 的位置与姿态运动；`RELEASE` 只在已附着且 TCP 到达对应篮子槽位后增加入篮计数，失败保留原场景状态；这是运动学夹取与释放仿真，不包含物理接触、夹持力或番茄脱离枝梗的动力学
+`GRASP` 只在新鲜实测 TCP 距选中果实满足夹取容差，且新鲜双夹指反馈均到达夹持位置时附着果实；附着后果实随实际 TCP 的位置与姿态运动；`RELEASE` 只在已附着、TCP 到达对应篮子槽位且双指已张开时增加入篮计数；缺少夹指反馈、反馈过期、闭合不足或尚未张开均返回失败，保留附着状态和入篮计数
+
+节点只读取 `/joint_states` 中的 `joint7-1`、`joint7-2`，忽略六轴机械臂等其他关节；闭合进度为 `(实测位置 - 张开位置) / (夹持位置 - 张开位置)`，左右指分别校准，兼容不同运动方向与行程；夹爪指令与完成等待由 Robot 执行，视觉节点不调用末端执行器服务；这是有夹指反馈校验的运动学夹取与释放仿真，不包含物理接触、夹持力或番茄脱离枝梗的动力学
 
 多果场景将全部果实、标签、TCP、目标点、篮子与计数作为一帧 `MarkerArray` 发布到 `/simulation/targets_array`，避免逐条 Marker 更新时球体、标签与计数处在不同场景帧；GRASP 与 RELEASE 返回前立即发布新状态，入篮后果实变绿，标签按果号错开高度
 
