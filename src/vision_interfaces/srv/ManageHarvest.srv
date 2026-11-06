@@ -1,0 +1,17 @@
+# Kinematic harvest simulation, using the first available TCP pose as its reference
+uint8 RESET=0
+uint8 SELECT_NEXT=1
+uint8 GRASP=2
+uint8 RELEASE=3
+uint8 command
+---
+bool success
+string message
+# One-based selected fruit index, or zero when no fruit is selected
+uint32 fruit_index
+uint32 total_fruits
+uint32 harvested_count
+bool finished
+geometry_msgs/PoseStamped home_pose
+geometry_msgs/PoseStamped retreat_pose
+geometry_msgs/PoseStamped place_pose

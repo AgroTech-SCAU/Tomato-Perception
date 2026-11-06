@@ -7,6 +7,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
 "msg/TargetPoint.msg"
 "srv/GetTargets.srv"
+"srv/ManageHarvest.srv"
 DEPENDENCIES geometry_msgs std_msgs
 )
 ament_export_dependencies(rosidl_default_runtime)

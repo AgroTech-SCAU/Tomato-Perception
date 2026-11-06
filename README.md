@@ -83,7 +83,8 @@ Tomato-Orbbec-Vision/
     │   ├── msg/
     │   │   └── TargetPoint.msg
     │   └── srv/
-    │       └── GetTargets.srv
+    │       ├── GetTargets.srv
+    │       └── ManageHarvest.srv         # 运动学采摘场景管理
     │
     └── vision_target_server/            # RGB-D 三维目标服务
         ├── config/
@@ -346,14 +347,14 @@ ros2 launch vision_target_server vision_server.launch.py
 
 ### 运动学仿真目标
 
-第一阶段仿真使用同一 `GetTargets` 接口，不加载 YOLO 或相机驱动；机械臂由 Robot 的仿真入口另行启动。服务持续按 30 Hz 采样机械臂 TF，返回缓存采样的时间戳，不把请求时间写成图像时间
+运动学仿真使用同一 `GetTargets` 接口，不加载 YOLO 或相机驱动；机械臂由 Robot 的仿真入口另行启动；服务持续按 30 Hz 采样机械臂 TF，返回缓存采样的时间戳，不把请求时间写成图像时间
 
 ```bash
 ros2 launch vision_target_server sim_targets.launch.py \
   calibration_file:=/absolute/path/handeye.yaml
 ```
 
-直接运行 `ros2 run vision_target_server sim_target_server --ros-args -p calibration_file:=/absolute/path/handeye.yaml` 也可使用相同参数。保持 `use_sim_time=false`，并与机械臂及编排程序使用同一个 `ROS_DOMAIN_ID`
+直接运行 `ros2 run vision_target_server sim_target_server --ros-args -p calibration_file:=/absolute/path/handeye.yaml` 也可使用相同参数；保持 `use_sim_time=false`，并与机械臂及编排程序使用同一个 `ROS_DOMAIN_ID`
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
@@ -369,11 +370,32 @@ ros2 launch vision_target_server sim_targets.launch.py \
 | `dropout_start_request` / `dropout_requests` | `2` / `0` | 从第几次有效查询起连续返回几次空目标，0 为关闭 |
 | `ambiguous_start_request` / `ambiguous_requests` | `2` / `0` | 从第几次有效查询起连续返回两个相距 10 mm 的成熟果，0 为关闭 |
 
-`sim_targets.launch.py` 支持表中标量 launch 参数；`sim_config:=/absolute/path/sim.yaml` 可提供完整 ROS 参数文件。将 `dropout_requests:=2` 或 `ambiguous_requests:=2` 用于短暂漏检或关联歧义；将 `initial_target_distance_m:=0.50` 用于首次行程预算拒绝场景。请求计数从节点启动后第一次成功且新鲜的查询开始，因此修改场景后应重启该模块，再运行完整流程
+`sim_targets.launch.py` 支持表中标量 launch 参数；`sim_config:=/absolute/path/sim.yaml` 可提供完整 ROS 参数文件；将 `dropout_requests:=2` 或 `ambiguous_requests:=2` 用于短暂漏检或关联歧义；将 `initial_target_distance_m:=0.50` 用于首次行程预算拒绝场景；请求计数从节点启动后第一次成功且新鲜的查询开始，因此修改场景后应重启该模块，再运行完整流程
 
-固定果实以 `visualization_msgs/msg/Marker` 发布到 `/simulation/targets`，可在 RViz 添加 Marker 显示。模拟目标没有渲染图像，像素、bbox 与深度 MAD 字段保持零值；该入口覆盖 TF、关联与运动闭环，RGB-D/YOLO 仍使用真实视觉服务
+固定果实以 `visualization_msgs/msg/Marker` 发布到 `/simulation/targets`，可在 RViz 添加 Marker 显示；模拟目标没有渲染图像，像素、bbox 与深度 MAD 字段保持零值；该入口覆盖 TF、关联与运动闭环，RGB-D/YOLO 仍使用真实视觉服务
 
-服务存在可作为节点就绪探测；目标可用需等待带时间戳的 `world_frame → tool_frame` 与 `world_frame → tcp_frame` TF。尚无样本返回 `NO_FRAME`，停止更新后返回 `STALE_FRAME`，正常漏检返回 `success=true` 的空目标；类别和置信度过滤与真实服务一致
+服务存在可作为节点就绪探测；目标可用需等待带时间戳的 `world_frame → tool_frame` 与 `world_frame → tcp_frame` TF；尚无样本返回 `NO_FRAME`，停止更新后返回 `STALE_FRAME`，正常漏检返回 `success=true` 的空目标；类别和置信度过滤与真实服务一致
+
+### 多果实采摘场景
+
+设置 `harvest_mode:=true` 后，`/simulation/harvest` 提供 `vision_interfaces/srv/ManageHarvest`，控制固定在首次 TCP 参考系中的果实与篮子；实际机械臂规划、运动和末端执行器指令由 Robot 流程编排负责
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `harvest_mode` | `false` | 保留原单目标模式；启用后只向视觉查询返回当前选中果实 |
+| `fruit_offsets_m` | `[-0.055,0,0.10, 0,0,0.12, 0.055,0,0.10]` | 依次排列的 XYZ，单位 m，相对首次 TCP；通过 `sim_config` 传入 |
+| `basket_offset_m` | `[0,-0.04,0]` | 篮子中心相对首次 TCP；各果实有间距 55 mm 的独立放置槽位；通过 `sim_config` 传入 |
+| `standoff_m` | `0.08` | RViz 中预接近点距果实中心的距离 |
+| `retreat_distance_m` | `0.10` | 撤离点距果实中心的距离，沿首次 TCP 的负 Z |
+| `grasp_tolerance_m` | `0.006` | 实测 TCP 距果实中心的最大夹取距离 |
+| `release_tolerance_m` | `0.01` | 实测 TCP 距对应篮子槽位的最大释放距离 |
+| `harvest_service_name` | `/simulation/harvest` | 场景服务名称 |
+
+流程依次调用 `RESET → SELECT_NEXT → GRASP → RELEASE`，每次释放后再次 `SELECT_NEXT`，直至 `finished=true`；`RESET` 从同一个首次 TCP 参考重建场景，取消后可重新开始；`fruit_index` 从 1 起算，0 表示未选中，响应同时给出总果数、入篮数、初始位姿、撤离位姿和当前果实的放置位姿
+
+`GRASP` 只在新鲜实测 TCP 距选中果实满足夹取容差时附着果实；附着后果实随实际 TCP 的位置与姿态运动；`RELEASE` 只在已附着且 TCP 到达对应篮子槽位后增加入篮计数，失败保留原场景状态；这是运动学夹取与释放仿真，不包含物理接触、夹持力或番茄脱离枝梗的动力学
+
+RViz 的 `/simulation/targets` 同时显示全部果实、选中项、青色 TCP、青色预接近点、黄色采摘中心、蓝色篮子与各果实状态标签；入篮后果实变绿；Marker 使用稳定 ID 与 Transient Local，可在流程开始后再打开 RViz
 
 ## Service API
 

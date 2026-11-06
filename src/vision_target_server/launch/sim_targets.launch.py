@@ -24,6 +24,12 @@ def generate_launch_description():
         'dropout_requests': ('0', int),
         'ambiguous_start_request': ('2', int),
         'ambiguous_requests': ('0', int),
+        'harvest_mode': ('false', bool),
+        'harvest_service_name': ('/simulation/harvest', str),
+        'grasp_tolerance_m': ('0.006', float),
+        'release_tolerance_m': ('0.01', float),
+        'retreat_distance_m': ('0.10', float),
+        'standoff_m': ('0.08', float),
     }
     declarations = [DeclareLaunchArgument(name, default_value=value) for name, (value, _) in defaults.items()]
     parameters = {name: ParameterValue(LaunchConfiguration(name), value_type=kind)
