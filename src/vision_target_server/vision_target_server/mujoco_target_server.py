@@ -96,7 +96,13 @@ class MujocoTargetServer(Node):
         scene_path = Path(self.get_parameter('harvest_scene_file').value).expanduser()
         if not scene_path.is_file():
             raise FileNotFoundError(f'harvest_scene_file does not exist: {scene_path}')
-        self._basket = parse_harvest_basket(yaml.safe_load(scene_path.read_text()))
+        scene = yaml.safe_load(scene_path.read_text())
+        self._basket = parse_harvest_basket(scene)
+        self._harvest_order = scene.get('harvest_order', [])
+        if (not isinstance(self._harvest_order, list) or
+                any(type(index) is not int for index in self._harvest_order) or
+                sorted(self._harvest_order) != list(range(1, len(self._harvest_order) + 1))):
+            raise ValueError('harvest_order must be a permutation of one-based fruit indices')
         if self._basket['frame_id'] != self._world_frame:
             raise ValueError('Harvest scene frame_id must match world_frame')
         calibration_path = Path(self.get_parameter('calibration_file').value).expanduser()
@@ -175,7 +181,8 @@ class MujocoTargetServer(Node):
                 self._camera_info = message
 
     def _physics_state(self, state):
-        if state.header.frame_id != self._world_frame or len(state.fruit_states) != len(state.fruit_poses):
+        if (state.header.frame_id != self._world_frame or len(state.fruit_states) != len(state.fruit_poses) or
+                (self._harvest_order and len(self._harvest_order) != len(state.fruit_poses))):
             self.get_logger().error('Physics state frame/fruit arrays do not match the configured harvest scene')
             return
         sample = PhysicsSample(state, time.monotonic_ns())
@@ -263,7 +270,9 @@ class MujocoTargetServer(Node):
             point = state.fruit_poses[index].position
             retreat = np.asarray([point.x, point.y, point.z]) - initial[:3, 2] * self.get_parameter('retreat_distance_m').value
         response.retreat_pose = self._pose(state, retreat)
-        response.place_pose = self._pose(state, self._place_point(state, max(index, 0)))
+        slot = (self._harvest_order.index(index + 1)
+                if index >= 0 and self._harvest_order else max(index, 0))
+        response.place_pose = self._pose(state, self._place_point(state, slot))
         orientation = response.place_pose.pose.orientation
         orientation.x, orientation.y, orientation.z, orientation.w = self._basket['release_orientation_xyzw']
         return response

@@ -729,4 +729,6 @@ ros2 run vision_target_server mujoco_target_server --ros-args \
 | `standoff_m` | `0.02` | 与现有仿真工程兼容的果前停距参数 |
 | `camera_info_topic` | `/camera/color/camera_info` | 可选相机内参，收到后填写真值目标的投影像素 |
 
+共享场景可用 `harvest_order` 指定一基果实编号的采摘顺序，与物理插件的同名参数保持一致；响应 `fruit_index` 保留物理果实身份，放置目标按该顺序映射到篮槽，不改变果实位置
+
 RViz 继续订阅 `/simulation/targets_array` 的完整 `MarkerArray`；每帧球体均来自实际物理位置，颜色区分待采摘、持握、下落、已收集和掉落，底板和四面侧壁与物理篮体一致；夹爪的实际开合由物理控制器的 `/joint_states` 与 Robot 模型显示
