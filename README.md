@@ -702,3 +702,31 @@ RGB 正常
 - ROS 2 Humble: https://docs.ros.org/en/humble/
 - Ultralytics YOLO: https://docs.ultralytics.com/
 
+
+### MuJoCo 物理采摘观测
+
+`mujoco_target_server` 为 MuJoCo 物理工程提供同一 `/vision/get_targets` 与 `/simulation/harvest` 接口；Robot 工程先启动 `tomato_picker_mujoco` 物理场景插件，再启动该节点，节点使用 `/clock`，不加载相机驱动或 YOLO
+
+```bash
+ros2 run vision_target_server mujoco_target_server --ros-args \
+  -p calibration_file:=/绝对路径/handeye.yaml \
+  -p harvest_scene_file:=/绝对路径/harvest_scene.yaml \
+  -p use_sim_time:=true
+```
+
+该入口从 `/simulation/physics/state` 读取果实真实位置、持握状态和收集计数，以同一物理采样时刻的 TF 与手眼外参转换成相机坐标；返回的时间戳保留物理采样时间，物理消息或 TF 停更后查询会返回 `STALE_FRAME`；这是标明来源的物理真值观测，RGB-D 图像检测继续使用 `vision_server`
+
+`ManageHarvest` 的 `RESET`、`SELECT_NEXT`、`GRASP`、`RELEASE` 分别代理 `/simulation/physics/reset`、`select_next`、`grasp`、`release`；命令成功后还会等待新 revision 的物理状态，夹取需物理插件确认实际持握，释放需真实落篮且计数增加，节点不设置物体位姿或模拟 TCP 附着
+
+| 参数 | 默认值 | 用途 |
+| --- | --- | --- |
+| `physics_state_topic` | `/simulation/physics/state` | 物理状态来源，`tomato_picker_interfaces/msg/HarvestPhysicsState` |
+| `physics_service_prefix` | `/simulation/physics` | 四个物理命令的服务前缀 |
+| `physics_service_timeout_s` | `15.0` | 命令和对应新状态到达的总等待时间，单位 s |
+| `calibration_file` | 必填 | 与物理相机安装方向相同的手眼外参 |
+| `harvest_scene_file` | 必填 | 与物理模型共用的世界坐标、篮底和释放位置配置 |
+| `retreat_distance_m` | `0.06` | 从实际果心沿初始 TCP 的负 Z 方向后退 |
+| `standoff_m` | `0.02` | 与现有仿真工程兼容的果前停距参数 |
+| `camera_info_topic` | `/camera/color/camera_info` | 可选相机内参，收到后填写真值目标的投影像素 |
+
+RViz 继续订阅 `/simulation/targets_array` 的完整 `MarkerArray`；每帧球体均来自实际物理位置，颜色区分待采摘、持握、下落、已收集和掉落，底板和四面侧壁与物理篮体一致；夹爪的实际开合由物理控制器的 `/joint_states` 与 Robot 模型显示

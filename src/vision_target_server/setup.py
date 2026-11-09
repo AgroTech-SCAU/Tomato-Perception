@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             'vision_server = vision_target_server.vision_server:main',
             'sim_target_server = vision_target_server.sim_target_server:main',
+            'mujoco_target_server = vision_target_server.mujoco_target_server:main',
         ],
     },
 )
